@@ -526,6 +526,7 @@ export default function LiveFeed() {
       ctx.strokeStyle = 'rgba(239,68,68,0.6)';
       ctx.stroke();
     }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [persons, visionData, visionAge, trackingInfo]);
 
   return (
