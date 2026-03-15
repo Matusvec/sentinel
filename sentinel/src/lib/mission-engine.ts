@@ -214,6 +214,19 @@ export async function clearMission(): Promise<void> {
   }
 }
 
+/**
+ * Set a pre-built MissionConfig directly without calling Gemini.
+ * Used by tools that build mission configs programmatically
+ * (e.g., fall detection tool with precise trigger config).
+ */
+export async function setMissionDirectly(config: MissionConfig): Promise<MissionConfig> {
+  activeMission = config;
+  nullCheckedAt = 0;
+  bridgeToLegacy(config);
+  await persistMission(config);
+  return config;
+}
+
 // ── Internal helpers ─────────────────────────────────────────
 
 /**

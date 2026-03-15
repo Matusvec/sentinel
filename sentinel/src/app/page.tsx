@@ -97,6 +97,16 @@ export default function CommandCenter() {
     return () => clearInterval(interval);
   }, []);
 
+  // Heartbeat — drives Telegram polling and temporal analysis independently
+  // of the Python perception pipeline. Runs every 3s so inbound Telegram
+  // messages are always processed even when Python isn't sending frames.
+  useEffect(() => {
+    const interval = setInterval(() => {
+      fetch('/api/sentinel/heartbeat').catch(() => {});
+    }, 3000);
+    return () => clearInterval(interval);
+  }, []);
+
   const handleModeChange = useCallback((mode: 'chat' | 'monitor' | 'scan') => {
     setCurrentMode(mode);
   }, []);

@@ -60,10 +60,11 @@ export function buildDocument(
   vision: VisionAnalysis | null,
   sensors: SensorSnapshot | undefined,
   mission: MissionConfig,
-  localCvPersonCount?: number
+  localCvPersonCount?: number,
+  localCvPersons?: Array<Record<string, unknown>>
 ): AdaptiveDocument {
   // Derive a flat pool of all available values from vision + sensors
-  const pool = deriveValuePool(vision, sensors);
+  const pool = deriveValuePool(vision, sensors, localCvPersons);
 
   // Override people_count with local CV if Gemini didn't run
   // (local CV is always available, Gemini is throttled)
@@ -142,7 +143,8 @@ export function shouldStore(
  */
 function deriveValuePool(
   vision: VisionAnalysis | null,
-  sensors: SensorSnapshot | undefined
+  sensors: SensorSnapshot | undefined,
+  localCvPersons?: Array<Record<string, unknown>>
 ): Record<string, unknown> {
   const people = vision?.people ?? [];
   const objects = vision?.objects ?? [];
@@ -187,13 +189,19 @@ function deriveValuePool(
     pan: sensors?.p ?? 90,
     tilt: sensors?.t ?? 90,
 
-    // ── Fall detection (common for elderly care) ──
-    on_floor: people.some(
-      (p) =>
-        p.activity === 'lying_floor' ||
-        p.description?.toLowerCase().includes('floor') ||
-        p.description?.toLowerCase().includes('fallen')
-    ),
+    // ── Fall detection (local CV + Gemini) ──
+    fall_detected: localCvPersons?.some((p) => p.fall_detected === true) ?? false,
+    fall_confidence: localCvPersons
+      ? Math.max(0, ...localCvPersons.map((p) => Number(p.fall_confidence) || 0))
+      : 0,
+    on_floor:
+      localCvPersons?.some((p) => p.fall_detected === true) ||
+      people.some(
+        (p) =>
+          p.activity === 'lying_floor' ||
+          p.description?.toLowerCase().includes('floor') ||
+          p.description?.toLowerCase().includes('fallen')
+      ),
 
     // ── Direction tracking (common for traffic) ──
     people_entering: people.filter(

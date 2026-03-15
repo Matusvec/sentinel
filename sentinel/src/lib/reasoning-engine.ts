@@ -167,6 +167,19 @@ export async function reason(input: ReasoningInput): Promise<ReasoningOutput> {
 
   const localTime = new Date().toLocaleTimeString('en-US', { hour12: true, timeZone: 'America/Los_Angeles' });
 
+  // Get frame early — needed for both context text and Gemini vision input
+  let frameForPrompt = latestFrameB64;
+  if (input.type === 'user_message') {
+    try {
+      const pythonUrl = process.env.PYTHON_URL || 'http://localhost:5000';
+      const res = await fetch(`${pythonUrl}/frame_b64`, { signal: AbortSignal.timeout(2000) });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.frame_b64) frameForPrompt = data.frame_b64;
+      }
+    } catch { /* non-critical — use cached frame */ }
+  }
+
   const contextLines = [
     `CURRENT TIME: ${localTime} (Pacific)`,
     `MODE: ${mode}`,
@@ -175,13 +188,15 @@ export async function reason(input: ReasoningInput): Promise<ReasoningOutput> {
     knownNames.length > 0 ? `IDENTIFIED IN FRAME: ${knownNames.join(', ')}` : '',
     unknownCount > 0 ? `UNIDENTIFIED: ${unknownCount} unknown person(s) in frame` : '',
     personDescriptions.length > 0 ? `PERSON DETAILS:\n${personDescriptions.join('\n')}` : '',
-    sensors ? `SENSORS: front=${(sensors.d as Record<string, unknown>)?.f}cm, IR=${JSON.stringify(sensors.ir)}, sound=${sensors.s}, GIMBAL: pan=${sensors.p} tilt=${sensors.t} (pan 0=right, 180=left, 90=center | tilt 20=up, 130=down, 70=straight)` : '',
+    sensors ? `SENSORS: front=${(sensors.d as Record<string, unknown>)?.f}cm, IR=${JSON.stringify(sensors.ir)}, sound=${sensors.s}, GIMBAL: pan=${sensors.p} tilt=${sensors.t} (pan 0=right, 180=left, 90=center | tilt 45=max up, 135=max down, 90=straight)` : '',
     sceneDesc ? `SCENE: ${sceneDesc}` : '',
     knownFacesStr,
     recentRecognitionsStr,
     recentEventsStr,
     chatHistoryStr,
-    latestFrameB64 ? '(Live camera frame attached — use it for visual questions)' : '(No camera frame)',
+    frameForPrompt
+      ? '(Live camera frame attached — use it for visual questions)'
+      : '(No camera frame attached right now — but you CAN still use describe_scene, search_for, or full_sweep tools which grab their own live frames. Do NOT refuse visual requests just because no frame is attached here.)',
   ].filter(Boolean).join('\n');
 
   // Build the prompt
@@ -232,7 +247,8 @@ GUIDELINES:
 - BE SMART with tool chaining: if one tool needs info from another, call them together. For example, if asked to "track me", call both describe_scene (to confirm someone is there) AND start_tracking. If asked to "scan and report", call scan_room AND describe_scene.
 - For tracking/following requests: use start_tracking. It will automatically find the person and point the gimbal at them.
 - For scanning: use scan_room to sweep, then describe_scene to report what you see.
-- For gimbal movement: only call move_gimbal ONCE. Calculate the final position from current SENSORS data (p=pan, t=tilt). "center the camera" = pan 90, tilt 70. Never call move_gimbal multiple times in one response.`;
+- For gimbal movement: only call move_gimbal ONCE. Calculate the final position from current SENSORS data (p=pan, t=tilt). "center the camera" = pan 90, tilt 90. Never call move_gimbal multiple times in one response.
+- For thorough searching: use full_sweep to systematically scan every direction. It steps through all pan angles and at each one checks up/middle/down tilt positions.`;
 
   let userContent: string;
   if (input.type === 'user_message') {
@@ -253,19 +269,6 @@ Local CV: ${JSON.stringify(localCv)}
 ${input.trigger ? `\nThis was flagged because: ${input.trigger}` : ''}
 
 You receive perception data every few seconds. Only act (should_act: true) when something MEANINGFUL happens — a state transition, threshold crossing, anomaly, or mission-relevant event. Most frames need no action.`;
-  }
-
-  // Get frame — try latestFrameB64, fallback to Python
-  let frameForPrompt = latestFrameB64;
-  if (!frameForPrompt && input.type === 'user_message') {
-    try {
-      const pythonUrl = process.env.PYTHON_URL || 'http://localhost:5000';
-      const res = await fetch(`${pythonUrl}/frame_b64`, { signal: AbortSignal.timeout(2000) });
-      if (res.ok) {
-        const data = await res.json();
-        if (data.frame_b64) frameForPrompt = data.frame_b64;
-      }
-    } catch { /* non-critical */ }
   }
 
   // Build Gemini request parts

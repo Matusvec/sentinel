@@ -3,15 +3,19 @@ import { analyzeFrame } from '@/lib/gemini';
 
 const PYTHON_URL = process.env.PYTHON_URL || 'http://localhost:5000';
 
+// Servo speed ~133 deg/sec (2 deg per 15ms step on Arduino)
+const SERVO_SPEED_DPS = 133;
+
 // Scan positions: sweep left to right, then tilt up/down
+// Tilt range: 45 (max up) to 135 (max down), 90 = straight
 const SCAN_POSITIONS = [
-  { pan: 180, tilt: 70 },  // far left
-  { pan: 135, tilt: 70 },  // left
-  { pan: 90, tilt: 70 },   // center
-  { pan: 45, tilt: 70 },   // right
-  { pan: 0, tilt: 70 },    // far right
-  { pan: 90, tilt: 30 },   // center up
-  { pan: 90, tilt: 110 },  // center down
+  { pan: 180, tilt: 90 },  // far left
+  { pan: 135, tilt: 90 },  // left
+  { pan: 90, tilt: 90 },   // center
+  { pan: 45, tilt: 90 },   // right
+  { pan: 0, tilt: 90 },    // far right
+  { pan: 90, tilt: 45 },   // center up
+  { pan: 90, tilt: 135 },  // center down
 ];
 
 async function moveGimbal(pan: number, tilt: number): Promise<void> {
@@ -35,6 +39,14 @@ async function sleep(ms: number): Promise<void> {
   return new Promise(r => setTimeout(r, ms));
 }
 
+/** Calculate settle time based on how far the gimbal needs to travel. */
+function settleTime(fromPan: number, fromTilt: number, toPan: number, toTilt: number): number {
+  const maxDelta = Math.max(Math.abs(toPan - fromPan), Math.abs(toTilt - fromTilt));
+  const travelMs = Math.ceil((maxDelta / SERVO_SPEED_DPS) * 1000);
+  // Travel time + 800ms for frame to stabilize after movement stops
+  return travelMs + 800;
+}
+
 export const searchForTool: ToolDefinition = {
   name: 'search_for',
   description: 'Scan the room systematically looking for something specific. Moves the gimbal to different positions, analyzes each view with Gemini Vision, and stops when the target is found. Use for "look around until you find...", "search for...", "find the...". Returns what was found and where.',
@@ -47,10 +59,13 @@ export const searchForTool: ToolDefinition = {
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) return { success: false, error: 'No Gemini API key' };
 
+    let prevPan = 90, prevTilt = 90;
     for (const pos of SCAN_POSITIONS) {
-      // Move gimbal to scan position
+      // Move gimbal to scan position and wait for it to arrive
       await moveGimbal(pos.pan, pos.tilt);
-      await sleep(1500); // wait for servo + frame to update
+      await sleep(settleTime(prevPan, prevTilt, pos.pan, pos.tilt));
+      prevPan = pos.pan;
+      prevTilt = pos.tilt;
 
       // Get a fresh frame from this position
       const frame = await getFrame();

@@ -2,11 +2,11 @@ import type { ToolDefinition } from './types';
 
 const PYTHON_URL = process.env.PYTHON_URL || 'http://localhost:5000';
 
-// Gimbal limits
+// Gimbal limits (must match Arduino: pan 0-180, tilt 45-135)
 const PAN_MIN = 0;
 const PAN_MAX = 180;
-const TILT_MIN = 20;
-const TILT_MAX = 130;
+const TILT_MIN = 45;
+const TILT_MAX = 135;
 
 /** Get a frame from Python. */
 async function getFrame(): Promise<string | null> {
@@ -147,7 +147,7 @@ export const startTrackingTool: ToolDefinition = {
 
     // Calculate offset from frame center (0.5, 0.5)
     // If target is right of center (x > 0.5), decrease pan (pan 0 = right)
-    // If target is below center (y > 0.5), increase tilt (tilt 130 = down)
+    // If target is below center (y > 0.5), increase tilt (tilt 135 = down)
     const offsetX = centerX - 0.5; // positive = right in frame
     const offsetY = centerY - 0.5; // positive = down in frame
 

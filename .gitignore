@@ -9,6 +9,7 @@ build/
 *.pyc
 __pycache__/
 venv/
+.venv/
 *.t7
 *.onnx
 *.task

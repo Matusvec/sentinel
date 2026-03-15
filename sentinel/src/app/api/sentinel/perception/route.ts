@@ -82,6 +82,67 @@ export async function POST(request: Request) {
       }
     }
 
+    // ── Fast-path fall detection (fires even without an active mission) ──
+    if (Array.isArray(localCvPersons)) {
+      const fallenPerson = (localCvPersons as Array<Record<string, unknown>>).find(
+        (p) => p.fall_detected === true
+      );
+      if (fallenPerson) {
+        const fallCooldownKey = 'fall_fastpath';
+        const lastFallAlert = lastFaceRecognized.get(fallCooldownKey) ?? 0;
+        const tickNow = Date.now();
+        if (tickNow - lastFallAlert > 10_000) {
+          lastFaceRecognized.set(fallCooldownKey, tickNow);
+          const baseUrl = process.env.NEXT_PUBLIC_BASE_URL || 'http://localhost:3000';
+          const fallName = (fallenPerson.name as string) || 'A person';
+          const fallConf = Math.round(((fallenPerson.fall_confidence as number) ?? 0) * 100);
+          const alertMsg = `Fall detected! ${fallName} may have fallen. Confidence: ${fallConf}%.`;
+
+          if (isAlertEnabled() && !isTypeMuted('fall_detection')) {
+            // Red LED + buzzer
+            const pythonUrl = process.env.PYTHON_URL || 'http://localhost:5000';
+            fetch(`${pythonUrl}/led`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ color: 'red', buzzer: true }),
+              signal: AbortSignal.timeout(2000),
+            }).catch(() => {});
+
+            // TTS alert
+            fetch(`${baseUrl}/api/sentinel/speak`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ text: alertMsg, context: 'alert' }),
+              signal: AbortSignal.timeout(5000),
+            }).catch(console.error);
+
+            // Telegram with photo
+            const photo = (perception.frame_b64 as string | undefined) || latestFrameB64;
+            fetch(`${baseUrl}/api/sentinel/telegram`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                type: 'alert',
+                text: alertMsg,
+                base64: photo || undefined,
+              }),
+              signal: AbortSignal.timeout(10000),
+            }).catch(console.error);
+
+            // Log event to MongoDB
+            db.collection('events').insertOne({
+              timestamp: new Date(),
+              event_type: 'fall_detected',
+              severity: 'critical',
+              description: alertMsg,
+              person_name: fallenPerson.name || null,
+              fall_confidence: fallenPerson.fall_confidence,
+            }).catch(console.error);
+          }
+        }
+      }
+    }
+
     // ── Mission-specific Gemini analysis (throttled) ──
     let missionVision: VisionAnalysis | null = null;
     const now = Date.now();
@@ -112,10 +173,11 @@ export async function POST(request: Request) {
     let adaptiveDoc: AdaptiveDocument | null = null;
 
     if (mission) {
-      // Build adaptive doc — feed local CV person count so triggers work
+      // Build adaptive doc — feed local CV person count + persons so triggers work
       // even between Gemini analysis intervals
       const localCvCount = (perception.local_cv as Record<string, unknown>)?.person_count as number | undefined;
-      adaptiveDoc = buildDocument(missionVision, sensors, mission, localCvCount ?? 0);
+      const localCvPersonsArr = Array.isArray(localCvPersons) ? localCvPersons as Array<Record<string, unknown>> : undefined;
+      adaptiveDoc = buildDocument(missionVision, sensors, mission, localCvCount ?? 0, localCvPersonsArr);
 
       if (shouldStore(adaptiveDoc, previousAdaptiveDoc)) {
         await db.collection('detections').insertOne({

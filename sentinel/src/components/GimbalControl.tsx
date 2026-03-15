@@ -5,9 +5,9 @@ import { useState, useRef, useCallback, useEffect } from 'react';
 /** Pan range: 0 (right) to 180 (left) */
 const PAN_MIN = 0;
 const PAN_MAX = 180;
-/** Tilt range: 20 (up) to 130 (down) */
-const TILT_MIN = 20;
-const TILT_MAX = 130;
+/** Tilt range: 45 (up) to 135 (down) — matches Arduino hardware limits */
+const TILT_MIN = 45;
+const TILT_MAX = 135;
 /** Default center position */
 const DEFAULT_PAN = 90;
 const DEFAULT_TILT = 70;

@@ -226,7 +226,7 @@ export default function LiveFeed() {
 
       // Draw video frame to offscreen canvas
       ctx.drawImage(video, 0, 0, 640, 480);
-      const dataUrl = captureCanvas.toDataURL('image/jpeg', 0.7);
+      const dataUrl = captureCanvas.toDataURL('image/jpeg', 0.55);
       const base64 = dataUrl.split(',')[1];
 
       try {
@@ -252,7 +252,7 @@ export default function LiveFeed() {
       }
     };
 
-    const interval = setInterval(analyzeFrame, 500);
+    const interval = setInterval(analyzeFrame, 200);
     return () => { aborted = true; clearInterval(interval); };
   }, [isStreaming]);
 

@@ -44,12 +44,24 @@ def auto_detect_arduino():
 ARDUINO_PORT = os.getenv('ARDUINO_PORT', auto_detect_arduino())
 ARDUINO_BAUD = 115200
 CAMERA_INDEX = int(os.getenv('CAMERA_INDEX', '0'))
-CAPTURE_INTERVAL = float(os.getenv('CAPTURE_INTERVAL', '0.5'))
+CAPTURE_INTERVAL = float(os.getenv('CAPTURE_INTERVAL', '0.2'))
 GEMINI_INTERVAL = float(os.getenv('GEMINI_INTERVAL', '3.0'))
 SERVER_URL = os.getenv('SENTINEL_SERVER', 'http://localhost:3000/api/sentinel')
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', '')
 MODEL_PATH = os.path.join(os.path.dirname(__file__), 'pose_landmarker_lite.task')
 LOCAL_CV_ENABLED = os.getenv('LOCAL_CV', '1') == '1'
+
+# ===== GIMBAL LIMITS (single source of truth) =====
+PAN_MIN = 0
+PAN_MAX = 180
+TILT_MIN = 45
+TILT_MAX = 135
+
+def clamp_pan(v: int) -> int:
+    return max(PAN_MIN, min(PAN_MAX, int(v)))
+
+def clamp_tilt(v: int) -> int:
+    return max(TILT_MIN, min(TILT_MAX, int(v)))
 
 # ===== GLOBAL STATE =====
 latest_sensor_data = {}
@@ -82,6 +94,73 @@ tracking_vx = 0.0        # velocity x (normalized units/sec)
 tracking_vy = 0.0        # velocity y
 tracking_last_seen = 0.0 # timestamp when target was last seen
 tracking_lost_steps = 0  # how many search steps taken since losing target
+
+
+class PIDController:
+    """PID controller with deadzone, anti-windup, output clamping, and rate limiting."""
+
+    def __init__(self, kp, ki, kd, deadzone=0.03, out_min=-90, out_max=90, max_rate=40.0):
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+        self.deadzone = deadzone
+        self.out_min = out_min
+        self.out_max = out_max
+        self.max_rate = max_rate  # max degrees/second change rate
+        self._integral = 0.0
+        self._prev_error = 0.0
+        self._prev_output = 0.0
+        self._last_time = 0.0
+
+    def reset(self):
+        self._integral = 0.0
+        self._prev_error = 0.0
+        self._prev_output = 0.0
+        self._last_time = 0.0
+
+    def update(self, error, now):
+        if abs(error) < self.deadzone:
+            self._integral = 0.0
+            # Decay previous output toward zero (smooth stop)
+            self._prev_output *= 0.7
+            return self._prev_output if abs(self._prev_output) > 0.3 else 0.0
+
+        dt = now - self._last_time if self._last_time > 0 else 0.02
+        dt = max(dt, 0.001)
+        self._last_time = now
+
+        self._integral += error * dt
+        max_integral = self.out_max / max(self.ki, 0.01)
+        self._integral = max(-max_integral, min(max_integral, self._integral))
+
+        # Low-pass filter on derivative to suppress noise
+        raw_derivative = (error - self._prev_error) / dt
+        derivative = max(-2.0, min(2.0, raw_derivative))  # clamp wild spikes
+        self._prev_error = error
+
+        output = self.kp * error + self.ki * self._integral + self.kd * derivative
+        output = max(self.out_min, min(self.out_max, output))
+
+        # Rate-limit: don't change output faster than max_rate degrees/sec
+        max_change = self.max_rate * dt
+        delta = output - self._prev_output
+        if abs(delta) > max_change:
+            output = self._prev_output + max_change * (1 if delta > 0 else -1)
+
+        self._prev_output = output
+        return output
+
+
+# PID controllers — tuned for smooth tracking, not twitchy
+# Lower gains prevent oscillation; larger deadzone ignores CV noise
+pid_pan = PIDController(kp=35, ki=3, kd=8, deadzone=0.03, out_min=-45, out_max=45, max_rate=50.0)
+pid_tilt = PIDController(kp=25, ki=2, kd=6, deadzone=0.03, out_min=-30, out_max=30, max_rate=35.0)
+
+# Thread-safe container for latest browser CV data
+import threading as _threading
+_cv_data_lock = _threading.Lock()
+_latest_cv_frame = None     # latest frame from browser
+_latest_cv_result = None    # latest CV result dict
 
 
 def init_camera():
@@ -172,15 +251,145 @@ def capture_frame():
     return None, None
 
 
-def perception_loop():
+def tracking_loop():
     """
-    Fast perception loop — local CV runs every CAPTURE_INTERVAL (0.5s),
-    Gemini runs async in background every GEMINI_INTERVAL (3s).
-    Each tick sends a perception update to the dashboard immediately.
+    Dedicated tracking thread — reads latest CV data and sends
+    gimbal commands at a rate the servos can actually follow.
+    Uses velocity-based prediction between CV frames.
     """
-    global latest_local_cv, latest_gemini_cache
     global tracking_last_cx, tracking_last_cy, tracking_vx, tracking_vy
     global tracking_last_seen, tracking_lost_steps
+
+    # Command throttling — don't send faster than servos can step
+    last_cmd_time = 0.0
+    CMD_INTERVAL = 0.08  # 12.5 Hz max — servos step at ~67Hz (15ms) but need time to travel
+    last_cmd_pan = 90
+    last_cmd_tilt = 90
+
+    # Lost-target search throttle (don't spiral at 50Hz)
+    SEARCH_INTERVAL = 0.4  # move search position every 400ms
+
+    while running:
+        try:
+            if not tracking_enabled or not arduino:
+                time.sleep(0.1)
+                continue
+
+            now = time.time()
+
+            # Get latest CV data (thread-safe)
+            with _cv_data_lock:
+                frame = _latest_cv_frame
+                local_cv_data = _latest_cv_result
+
+            cur_pan = latest_sensor_data.get('p', 90)
+            cur_tilt = latest_sensor_data.get('t', 70)
+
+            track_cx, track_cy = None, None
+            if frame is not None:
+                track_cx, track_cy = _get_tracking_center(
+                    frame, local_cv_data, now
+                )
+
+            if track_cx is not None:
+                # Target found — update velocity and follow
+                dt = now - tracking_last_seen if tracking_last_seen > 0 else 0.02
+                if 0 < dt < 2.0:
+                    # Heavier smoothing on velocity to reduce jitter
+                    alpha = 0.3
+                    raw_vx = (track_cx - tracking_last_cx) / dt
+                    raw_vy = (track_cy - tracking_last_cy) / dt
+                    tracking_vx = alpha * raw_vx + (1 - alpha) * tracking_vx
+                    tracking_vy = alpha * raw_vy + (1 - alpha) * tracking_vy
+
+                tracking_last_cx = track_cx
+                tracking_last_cy = track_cy
+                tracking_last_seen = now
+                tracking_lost_steps = 0
+
+                # Mild predictive offset — only for fast movement
+                speed = (tracking_vx ** 2 + tracking_vy ** 2) ** 0.5
+                lead_time = 0.15 if speed > 0.4 else 0.08 if speed > 0.15 else 0.0
+                pred_cx = track_cx + tracking_vx * lead_time
+                pred_cy = track_cy + tracking_vy * lead_time
+                # Clamp prediction to stay within frame
+                pred_cx = max(0.05, min(0.95, pred_cx))
+                pred_cy = max(0.05, min(0.95, pred_cy))
+
+                offset_x = pred_cx - 0.5
+                offset_y = pred_cy - 0.5
+
+                pan_correction = pid_pan.update(-offset_x, now)
+                tilt_correction = pid_tilt.update(offset_y, now)
+
+                # Only send if correction is meaningful AND enough time has passed
+                if now - last_cmd_time >= CMD_INTERVAL:
+                    if abs(pan_correction) > 0.5 or abs(tilt_correction) > 0.5:
+                        new_pan = clamp_pan(cur_pan + pan_correction)
+                        new_tilt = clamp_tilt(cur_tilt + tilt_correction)
+                        # Skip if command is basically the same as last one
+                        if abs(new_pan - last_cmd_pan) >= 1 or abs(new_tilt - last_cmd_tilt) >= 1:
+                            send_arduino_command(f"MOVE:{new_pan},{new_tilt}")
+                            last_cmd_pan = new_pan
+                            last_cmd_tilt = new_tilt
+                            last_cmd_time = now
+            else:
+                # Target lost — gentle search pattern (throttled)
+                time_lost = now - tracking_last_seen if tracking_last_seen > 0 else 0
+
+                if time_lost > 0.5 and time_lost < 15.0 and now - last_cmd_time >= SEARCH_INTERVAL:
+                    tracking_lost_steps += 1
+
+                    if time_lost < 1.5:
+                        # First 1.5s: drift in last velocity direction (gentle)
+                        step_size = 5
+                        speed = (tracking_vx ** 2 + tracking_vy ** 2) ** 0.5
+                        if speed > 0.03:
+                            pan_step = -step_size * (tracking_vx / speed)
+                            tilt_step = step_size * 0.5 * (tracking_vy / speed)
+                        else:
+                            pan_step = 0
+                            tilt_step = 0
+                    else:
+                        # Slow expanding spiral from last known position
+                        import math
+                        spiral_step = tracking_lost_steps
+                        angle = spiral_step * 40 * math.pi / 180  # ~40 deg per step
+                        radius = min(5 + spiral_step * 1.5, 25)   # expand from 5 to 25 degrees
+                        pan_step = radius * math.cos(angle)
+                        tilt_step = radius * math.sin(angle) * 0.4
+
+                    new_pan = clamp_pan(cur_pan + pan_step)
+                    new_tilt = clamp_tilt(cur_tilt + tilt_step)
+                    send_arduino_command(f"MOVE:{new_pan},{new_tilt}")
+                    last_cmd_pan = new_pan
+                    last_cmd_tilt = new_tilt
+                    last_cmd_time = now
+
+                elif time_lost >= 15.0:
+                    # Lost too long — return to center once
+                    if tracking_lost_steps > 0:
+                        send_arduino_command(f"MOVE:90,{(TILT_MIN + TILT_MAX) // 2}")
+                        tracking_lost_steps = 0
+                        pid_pan.reset()
+                        pid_tilt.reset()
+                        last_cmd_time = now
+
+            time.sleep(0.04)  # 25Hz — fast enough for smooth tracking
+
+        except Exception as e:
+            print(f"Tracking loop error: {e}")
+            time.sleep(0.1)
+
+
+def perception_loop():
+    """
+    Fast perception loop — local CV runs every CAPTURE_INTERVAL (0.2s),
+    Gemini runs async in background every GEMINI_INTERVAL (3s).
+    Each tick sends a perception update to the dashboard immediately.
+    Tracking is handled by the dedicated tracking_loop() thread at 50Hz.
+    """
+    global latest_local_cv, latest_gemini_cache, _latest_cv_frame, _latest_cv_result
     frame_ts = 0
 
     # Gemini runs in background thread, never blocks the loop
@@ -209,72 +418,10 @@ def perception_loop():
             if local_cv_data:
                 latest_local_cv = local_cv_data
 
-            # ── Continuous tracking with prediction and search ──
-            if tracking_enabled and frame is not None and arduino:
-                track_cx, track_cy = _get_tracking_center(
-                    frame, local_cv_data, now
-                )
-                cur_pan = latest_sensor_data.get('p', 90)
-                cur_tilt = latest_sensor_data.get('t', 70)
-
-                if track_cx is not None:
-                    # ── Target found — update velocity and follow ──
-                    dt = now - tracking_last_seen if tracking_last_seen > 0 else 0.5
-                    if dt > 0 and dt < 2.0:  # reasonable time delta
-                        # Exponential smoothing on velocity
-                        alpha = 0.4
-                        raw_vx = (track_cx - tracking_last_cx) / dt
-                        raw_vy = (track_cy - tracking_last_cy) / dt
-                        tracking_vx = alpha * raw_vx + (1 - alpha) * tracking_vx
-                        tracking_vy = alpha * raw_vy + (1 - alpha) * tracking_vy
-
-                    tracking_last_cx = track_cx
-                    tracking_last_cy = track_cy
-                    tracking_last_seen = now
-                    tracking_lost_steps = 0
-
-                    # Predictive offset: lead the target slightly based on velocity
-                    lead_time = 0.15  # seconds to predict ahead
-                    pred_cx = track_cx + tracking_vx * lead_time
-                    pred_cy = track_cy + tracking_vy * lead_time
-
-                    offset_x = pred_cx - 0.5
-                    offset_y = pred_cy - 0.5
-                    dist = (offset_x ** 2 + offset_y ** 2) ** 0.5
-
-                    if dist > 0.02:
-                        gain = 50 if dist > 0.2 else 35
-                        new_pan = int(max(0, min(180, cur_pan - offset_x * gain)))
-                        new_tilt = int(max(20, min(130, cur_tilt + offset_y * gain * 0.7)))
-                        send_arduino_command(f"MOVE:{new_pan},{new_tilt}")
-
-                else:
-                    # ── Target lost — search in last known direction ──
-                    time_lost = now - tracking_last_seen if tracking_last_seen > 0 else 0
-                    if time_lost > 0.5 and time_lost < 10.0:
-                        tracking_lost_steps += 1
-
-                        # Move in the direction of last velocity (where they were going)
-                        # Each step moves ~8 degrees in that direction
-                        step_size = 8
-                        if abs(tracking_vx) > 0.05 or abs(tracking_vy) > 0.05:
-                            # Follow velocity direction
-                            pan_step = -step_size if tracking_vx > 0 else step_size if tracking_vx < 0 else 0
-                            tilt_step = step_size * 0.5 if tracking_vy > 0 else -step_size * 0.5 if tracking_vy < 0 else 0
-                        else:
-                            # No velocity info — search toward last known side
-                            pan_step = -step_size if tracking_last_cx > 0.5 else step_size
-                            tilt_step = 0
-
-                        new_pan = int(max(0, min(180, cur_pan + pan_step)))
-                        new_tilt = int(max(20, min(130, cur_tilt + tilt_step)))
-                        send_arduino_command(f"MOVE:{new_pan},{new_tilt}")
-
-                    elif time_lost >= 10.0:
-                        # Lost for too long — return to center and stop searching
-                        if tracking_lost_steps > 0:
-                            send_arduino_command("MOVE:90,70")
-                            tracking_lost_steps = 0
+            # ── Update thread-safe CV data for tracking thread ──
+            with _cv_data_lock:
+                _latest_cv_frame = frame
+                _latest_cv_result = local_cv_data
 
             # ── Kick off Gemini in background (non-blocking) ──
             if gemini and gemini.should_analyze():
@@ -413,8 +560,8 @@ class CommandHandler(BaseHTTPRequestHandler):
             self._send_json({'ok': True})
 
         elif self.path == '/gimbal':
-            pan = body.get('pan', 90)
-            tilt = body.get('tilt', 90)
+            pan = clamp_pan(body.get('pan', 90))
+            tilt = clamp_tilt(body.get('tilt', 90))
             send_arduino_command(f"MOVE:{pan},{tilt}")
             self._send_json({'ok': True, 'pan': pan, 'tilt': tilt})
 
@@ -493,6 +640,8 @@ class CommandHandler(BaseHTTPRequestHandler):
                 tracking_vy = 0.0
                 tracking_last_seen = 0.0
                 tracking_lost_steps = 0
+                pid_pan.reset()
+                pid_tilt.reset()
                 desc = tracking_target_desc or f'Person {tracking_target_id}'
                 print(f"[track] Started tracking: {desc}")
                 self._send_json({'ok': True, 'tracking': True, 'target': desc})
@@ -501,6 +650,8 @@ class CommandHandler(BaseHTTPRequestHandler):
                 tracking_target_desc = None
                 tracking_last_bbox = None
                 tracking_template = None
+                pid_pan.reset()
+                pid_tilt.reset()
                 print("[track] Stopped tracking")
                 self._send_json({'ok': True, 'tracking': False})
 
@@ -636,39 +787,68 @@ def _get_tracking_center(frame, local_cv_data, now):
         return None, None
 
     else:
-        # ── Person tracking via CV — prioritize face position ──
+        # ── Person tracking via CV — face first, then body ──
         if not local_cv_data:
             return None, None
         persons = local_cv_data.get('persons', [])
+        if not persons:
+            return None, None
+
+        # Find the target person — by ID if specified, else closest to last known position
         target = None
         for p in persons:
             if p.get('id') == tracking_target_id:
                 target = p
                 break
-        if not target and persons:
-            target = persons[0]
+        if not target:
+            # Pick the person closest to where we were last tracking
+            best_dist = float('inf')
+            for p in persons:
+                c = p.get('center', {})
+                dx = c.get('x', 0.5) - tracking_last_cx
+                dy = c.get('y', 0.5) - tracking_last_cy
+                d = dx * dx + dy * dy
+                if d < best_dist:
+                    best_dist = d
+                    target = p
         if not target:
             return None, None
 
-        # Priority 1: nose landmark (index 0) — best for face tracking
         landmarks = target.get('landmarks', [])
-        if landmarks and len(landmarks) > 0:
-            nose = landmarks[0]  # MediaPipe landmark 0 = nose
-            if nose.get('v', 0) > 0.5:
-                return nose['x'], nose['y']
+        if not landmarks:
+            # No landmarks — use body center
+            if target.get('center'):
+                return target['center']['x'], target['center']['y']
+            return None, None
 
-        # Priority 2: face bbox center (if this is a face-only detection)
-        if target.get('landmark_count', 99) == 0 and target.get('center'):
-            return target['center']['x'], target['center']['y']
+        # Weighted centroid — each landmark contributes based on visibility
+        # Face landmarks get boosted weight for smooth face-to-body transitions
+        WEIGHTS = {
+            0: 1.5,   # nose — highest priority
+            1: 1.2, 2: 1.2, 3: 1.2, 4: 1.2, 5: 1.2, 6: 1.2,  # eyes
+            7: 0.8, 8: 0.8,  # ears
+            11: 0.6, 12: 0.6,  # shoulders
+        }
 
-        # Priority 3: shoulder midpoint (upper body, closer to face than hips)
-        if landmarks and len(landmarks) > 12:
-            l_shoulder = landmarks[11]
-            r_shoulder = landmarks[12]
-            if l_shoulder.get('v', 0) > 0.4 and r_shoulder.get('v', 0) > 0.4:
-                cx = (l_shoulder['x'] + r_shoulder['x']) / 2
-                cy = (l_shoulder['y'] + r_shoulder['y']) / 2 - 0.05  # shift up toward head
-                return cx, cy
+        total_weight = 0.0
+        cx_sum = 0.0
+        cy_sum = 0.0
+
+        for i, lm in enumerate(landmarks):
+            vis = lm.get('v', 0)
+            if vis < 0.3:
+                continue
+            w = WEIGHTS.get(i, 0.3) * vis
+            cx_sum += lm['x'] * w
+            cy_sum += lm['y'] * w
+            total_weight += w
+
+        if total_weight > 0:
+            cx = cx_sum / total_weight
+            cy = cy_sum / total_weight
+            # Shift up slightly toward head (landmarks tend to center on torso)
+            cy -= 0.03
+            return cx, cy
 
         # Fallback: body center
         if target.get('center'):
@@ -730,6 +910,10 @@ def main():
     # Start Arduino reader thread
     arduino_thread = threading.Thread(target=read_arduino_data, daemon=True)
     arduino_thread.start()
+
+    # Start dedicated tracking thread (50Hz)
+    tracking_thread = threading.Thread(target=tracking_loop, daemon=True)
+    tracking_thread.start()
 
     # Start command server thread
     server_thread = threading.Thread(target=start_http_server, daemon=True)

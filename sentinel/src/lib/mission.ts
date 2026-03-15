@@ -14,7 +14,7 @@
 export interface MissionTrigger {
   type: 'people_count_exceeds' | 'person_entered' | 'lingering_detected' |
         'object_detected' | 'distance_below' | 'perimeter_breach' |
-        'activity_level' | 'custom_condition';
+        'activity_level' | 'custom_condition' | 'fall_detected';
   threshold?: number;
   searchTerm?: string;
   durationSeconds?: number;

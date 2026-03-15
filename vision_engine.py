@@ -101,6 +101,8 @@ class TrackedPerson:
     activity: str = "unknown"  # "still", "moving", "fast"
     name: Optional[str] = None  # recognized known face name
     name_confidence: float = 0.0
+    fall_detected: bool = False
+    fall_confidence: float = 0.0
 
     def to_dict(self) -> dict:
         d = {
@@ -114,6 +116,8 @@ class TrackedPerson:
                 {"x": round(x, 4), "y": round(y, 4), "v": round(v, 2)}
                 for x, y, v in self.landmarks
             ] if self.landmarks else [],
+            "fall_detected": self.fall_detected,
+            "fall_confidence": round(self.fall_confidence, 3),
         }
         if self.name:
             d["name"] = self.name
@@ -137,6 +141,7 @@ class FrameResult:
             "face_count": len(self.faces),
             "persons": [p.to_dict() for p in self.persons],
             "timestamp": self.timestamp,
+            "fall_alert": any(p.fall_detected for p in self.persons),
         }
 
 
@@ -272,6 +277,211 @@ class FaceRegistry:
         return results
 
 
+# ── Fall Detector (real-time CV-based) ─────────────────────────
+
+@dataclass
+class FallState:
+    """Per-person fall detection state."""
+    prev_hip_y: float = 0.5
+    prev_time: float = 0.0
+    confidence: float = 0.0
+    frames_above: int = 0       # consecutive frames above threshold
+    fall_detected: bool = False
+    fall_start_time: float = 0.0
+    frames_below: int = 0       # consecutive frames below clear threshold
+
+
+class FallDetector:
+    """
+    Analyzes pose landmarks per person per frame to detect falls.
+
+    Uses four scoring signals combined with temporal filtering (EMA smoothing
+    + consecutive frame confirmation) to minimize false positives from
+    bending, sitting, or picking things up.
+    """
+
+    # Scoring weights
+    W_TORSO_ANGLE = 0.35
+    W_VELOCITY = 0.20
+    W_ASPECT_RATIO = 0.20
+    W_SHOULDER_HIP = 0.25
+
+    # Thresholds
+    EMA_ALPHA = 0.4            # smoothing: 0.4 * raw + 0.6 * prev
+    CONFIRM_THRESHOLD = 0.65   # confidence must exceed this
+    CONFIRM_FRAMES = 3         # for this many consecutive frames (~1.5s at 2Hz)
+    CLEAR_THRESHOLD = 0.3      # confidence must drop below this
+    CLEAR_FRAMES = 5           # for this many consecutive frames to clear
+
+    def __init__(self):
+        self._states: dict[int, FallState] = {}
+
+    def analyze(self, persons: list, now: float) -> None:
+        """
+        Analyze all tracked persons for falls. Updates fall_detected and
+        fall_confidence fields on each TrackedPerson in-place.
+        """
+        active_ids = set()
+
+        for person in persons:
+            if not person.landmarks or len(person.landmarks) < 25:
+                continue  # need at least hip + shoulder landmarks
+
+            pid = person.index
+            active_ids.add(pid)
+
+            if pid not in self._states:
+                self._states[pid] = FallState(prev_time=now)
+
+            state = self._states[pid]
+            raw_score = self._compute_score(person, state, now)
+
+            # EMA smoothing
+            state.confidence = (
+                self.EMA_ALPHA * raw_score + (1.0 - self.EMA_ALPHA) * state.confidence
+            )
+
+            # Temporal confirmation
+            if state.confidence > self.CONFIRM_THRESHOLD:
+                state.frames_above += 1
+                state.frames_below = 0
+            elif state.confidence < self.CLEAR_THRESHOLD:
+                state.frames_below += 1
+                state.frames_above = 0
+            else:
+                # In the middle zone — don't reset counters
+                pass
+
+            # Confirm fall
+            if not state.fall_detected and state.frames_above >= self.CONFIRM_FRAMES:
+                state.fall_detected = True
+                state.fall_start_time = now
+
+            # Clear fall
+            if state.fall_detected and state.frames_below >= self.CLEAR_FRAMES:
+                state.fall_detected = False
+                state.fall_start_time = 0.0
+
+            # Update hip tracking for next frame
+            hip_y = self._get_hip_midpoint_y(person.landmarks)
+            if hip_y is not None:
+                state.prev_hip_y = hip_y
+            state.prev_time = now
+
+            # Write results back to person
+            person.fall_detected = state.fall_detected
+            person.fall_confidence = state.confidence
+
+        # Clean up stale states (person no longer tracked)
+        stale = [pid for pid in self._states if pid not in active_ids]
+        for pid in stale:
+            if now - self._states[pid].prev_time > 5.0:
+                del self._states[pid]
+
+    def _compute_score(self, person: TrackedPerson, state: FallState, now: float) -> float:
+        """Compute raw fall score (0.0–1.0) from four signals."""
+        lm = person.landmarks
+        score = 0.0
+
+        # ── Signal 1: Torso angle from vertical ──
+        torso_angle = self._torso_angle(lm)
+        if torso_angle is not None:
+            # Score rises above 60 degrees, maxes at 90
+            angle_score = max(0.0, min(1.0, (torso_angle - 60.0) / 30.0))
+            score += self.W_TORSO_ANGLE * angle_score
+
+        # ── Signal 2: Vertical velocity (sudden hip drop) ──
+        hip_y = self._get_hip_midpoint_y(lm)
+        if hip_y is not None and state.prev_time > 0:
+            dt = now - state.prev_time
+            if 0.05 < dt < 2.0:  # reasonable frame interval
+                delta_y = hip_y - state.prev_hip_y  # positive = downward
+                # Score high when delta_y > 0.05 in 0.5s
+                velocity = delta_y / dt
+                vel_score = max(0.0, min(1.0, (velocity - 0.05) / 0.15))
+                score += self.W_VELOCITY * vel_score
+
+        # ── Signal 3: Bounding box aspect ratio ──
+        bbox = person.bbox
+        bw = bbox.get("width", 0)
+        bh = bbox.get("height", 0)
+        if bh > 0.01:
+            # Standing: h > w. Fallen: w > h. Score = max(0, 1 - h/w)
+            ratio = bh / bw if bw > 0.01 else 10.0
+            aspect_score = max(0.0, min(1.0, 1.0 - ratio))
+            score += self.W_ASPECT_RATIO * aspect_score
+
+        # ── Signal 4: Shoulder-hip vertical alignment ──
+        alignment_diff = self._shoulder_hip_diff(lm)
+        if alignment_diff is not None:
+            # Standing: large Y diff (shoulders well above hips)
+            # Lying: similar Y. Score rises when diff < 0.12
+            align_score = max(0.0, min(1.0, (0.12 - alignment_diff) / 0.12))
+            score += self.W_SHOULDER_HIP * align_score
+
+        return max(0.0, min(1.0, score))
+
+    @staticmethod
+    def _get_hip_midpoint_y(landmarks: list) -> Optional[float]:
+        """Get Y coordinate of hip midpoint (landmarks 23, 24)."""
+        if len(landmarks) < 25:
+            return None
+        l_hip = landmarks[23]  # (x, y, visibility)
+        r_hip = landmarks[24]
+        if l_hip[2] > 0.3 and r_hip[2] > 0.3:
+            return (l_hip[1] + r_hip[1]) / 2.0
+        return None
+
+    @staticmethod
+    def _torso_angle(landmarks: list) -> Optional[float]:
+        """
+        Angle of torso vector from vertical (degrees).
+        Vector from hip midpoint to shoulder midpoint.
+        Returns 0 for perfectly upright, 90 for horizontal.
+        """
+        if len(landmarks) < 25:
+            return None
+        l_hip = landmarks[23]
+        r_hip = landmarks[24]
+        l_shoulder = landmarks[11]
+        r_shoulder = landmarks[12]
+        if (l_hip[2] < 0.3 or r_hip[2] < 0.3 or
+                l_shoulder[2] < 0.3 or r_shoulder[2] < 0.3):
+            return None
+
+        hip_x = (l_hip[0] + r_hip[0]) / 2.0
+        hip_y = (l_hip[1] + r_hip[1]) / 2.0
+        shoulder_x = (l_shoulder[0] + r_shoulder[0]) / 2.0
+        shoulder_y = (l_shoulder[1] + r_shoulder[1]) / 2.0
+
+        # Vector from hip to shoulder (in image coords: y increases downward)
+        dx = shoulder_x - hip_x
+        dy = hip_y - shoulder_y  # flip so upward is positive
+
+        # Angle from vertical (straight up = 0 degrees)
+        angle_rad = math.atan2(abs(dx), dy) if dy != 0 else math.pi / 2
+        return math.degrees(angle_rad)
+
+    @staticmethod
+    def _shoulder_hip_diff(landmarks: list) -> Optional[float]:
+        """
+        Vertical distance between shoulder midpoint and hip midpoint (normalized).
+        Large value = standing. Small value = lying down.
+        """
+        if len(landmarks) < 25:
+            return None
+        l_hip = landmarks[23]
+        r_hip = landmarks[24]
+        l_shoulder = landmarks[11]
+        r_shoulder = landmarks[12]
+        if (l_hip[2] < 0.3 or r_hip[2] < 0.3 or
+                l_shoulder[2] < 0.3 or r_shoulder[2] < 0.3):
+            return None
+
+        hip_y = (l_hip[1] + r_hip[1]) / 2.0
+        shoulder_y = (l_shoulder[1] + r_shoulder[1]) / 2.0
+        return abs(hip_y - shoulder_y)
+
 
 # ── Vision Engine ──────────────────────────────────────────────
 
@@ -318,6 +528,9 @@ class VisionEngine:
 
         # Known face recognition
         self.face_registry = FaceRegistry()
+
+        # Fall detection
+        self.fall_detector = FallDetector()
 
         # Movement tracking state
         self._trails: dict[int, deque] = {}
@@ -485,6 +698,9 @@ class VisionEngine:
                         p.name = name
                         p.name_confidence = confidence
                         break
+
+        # ── Fall detection (analyzes pose landmarks per person) ──
+        self.fall_detector.analyze(persons, now)
 
         # Clean up stale trails
         active_indices = {p.index for p in persons}

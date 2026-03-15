@@ -13,6 +13,11 @@ const int PAN_PIN = 9;
 const int TILT_PIN = 10;
 int currentPan = 90;
 int currentTilt = 90;
+int targetPan = 90;
+int targetTilt = 90;
+unsigned long lastServoStep = 0;
+const int SERVO_STEP_INTERVAL = 15; // ms between steps
+const int SERVO_STEP_SIZE = 2;      // degrees per step
 
 // ===== ULTRASONIC SETUP =====
 #define FRONT_TRIG 2
@@ -91,11 +96,23 @@ void setup() {
 }
 
 void loop() {
-  if (Serial.available()) {
+  // Flush serial — process all available commands, but for MOVE only keep the latest
+  String latestMove = "";
+  while (Serial.available()) {
     String cmd = Serial.readStringUntil('\n');
     cmd.trim();
-    handleCommand(cmd);
+    if (cmd.length() == 0) continue;
+    if (cmd.startsWith("MOVE:") || cmd.startsWith("PAN:") || cmd.startsWith("TILT:")) {
+      latestMove = cmd;  // overwrite — only keep newest positioning command
+    } else {
+      handleCommand(cmd);  // LED, BUZZ, SCAN etc. execute immediately
+    }
   }
+  if (latestMove.length() > 0) {
+    handleCommand(latestMove);
+  }
+
+  stepServos();
 
   if (scanning) {
     runScanPattern();
@@ -114,17 +131,17 @@ void handleCommand(String cmd) {
     int commaIdx = cmd.indexOf(',', 5);
     int pan = cmd.substring(5, commaIdx).toInt();
     int tilt = cmd.substring(commaIdx + 1).toInt();
-    moveServos(pan, tilt);
+    setServoTarget(pan, tilt);
     scanning = false;
   }
   else if (cmd.startsWith("PAN:")) {
     int angle = cmd.substring(4).toInt();
-    moveServos(angle, currentTilt);
+    setServoTarget(angle, currentTilt);
     scanning = false;
   }
   else if (cmd.startsWith("TILT:")) {
     int angle = cmd.substring(5).toInt();
-    moveServos(currentPan, angle);
+    setServoTarget(currentPan, angle);
     scanning = false;
   }
   else if (cmd == "SCAN:START") {
@@ -158,21 +175,24 @@ void handleCommand(String cmd) {
   }
 }
 
-void moveServos(int pan, int tilt) {
-  pan = constrain(pan, 0, 180);
-  tilt = constrain(tilt, 45, 135);
+void setServoTarget(int pan, int tilt) {
+  targetPan = constrain(pan, 0, 180);
+  targetTilt = constrain(tilt, 45, 135);
+}
 
-  // Smooth movement
-  while (currentPan != pan || currentTilt != tilt) {
-    if (currentPan < pan) currentPan = min(currentPan + 2, pan);
-    else if (currentPan > pan) currentPan = max(currentPan - 2, pan);
+void stepServos() {
+  if (millis() - lastServoStep < SERVO_STEP_INTERVAL) return;
+  lastServoStep = millis();
 
-    if (currentTilt < tilt) currentTilt = min(currentTilt + 2, tilt);
-    else if (currentTilt > tilt) currentTilt = max(currentTilt - 2, tilt);
+  if (currentPan != targetPan || currentTilt != targetTilt) {
+    if (currentPan < targetPan) currentPan = min(currentPan + SERVO_STEP_SIZE, targetPan);
+    else if (currentPan > targetPan) currentPan = max(currentPan - SERVO_STEP_SIZE, targetPan);
+
+    if (currentTilt < targetTilt) currentTilt = min(currentTilt + SERVO_STEP_SIZE, targetTilt);
+    else if (currentTilt > targetTilt) currentTilt = max(currentTilt - SERVO_STEP_SIZE, targetTilt);
 
     panServo.write(currentPan);
     tiltServo.write(currentTilt);
-    delay(15);
   }
 }
 

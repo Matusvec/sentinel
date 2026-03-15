@@ -79,7 +79,9 @@ export function evaluateTriggers(
     const triggerKey = buildKey(mission.id, trigger);
     const lastTime = lastFiredAt.get(triggerKey) ?? 0;
     const cooldown = (trigger.durationSeconds ?? 30) * 1000;
-    const effectiveCooldown = Math.max(cooldown, DEFAULT_COOLDOWN_MS);
+    // Fall detection uses shorter cooldown (5s) so it re-alerts if person remains fallen
+    const minCooldown = trigger.type === 'fall_detected' ? 5_000 : DEFAULT_COOLDOWN_MS;
+    const effectiveCooldown = Math.max(cooldown, minCooldown);
     if (now - lastTime < effectiveCooldown) continue;
 
     // ── Evaluate condition ──
@@ -132,6 +134,14 @@ export function evaluateTriggers(
         met = asBool(extracted.has_fast_movement);
         severity = 'warning';
         break;
+
+      case 'fall_detected': {
+        const fallDetected = asBool(extracted.fall_detected);
+        const fallConfidence = asNumber(extracted.fall_confidence, 0);
+        met = fallDetected && fallConfidence > 0.6;
+        severity = 'critical';
+        break;
+      }
 
       case 'custom_condition': {
         // Heuristic: check if Gemini flagged anything as "interesting"

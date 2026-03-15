@@ -17,6 +17,8 @@ import { startTrackingTool } from './start-tracking.tool';
 import { scanRoomTool } from './scan-room.tool';
 import { searchForTool } from './search-for.tool';
 import { manageAlertsTool } from './manage-alerts.tool';
+import { fullSweepTool } from './full-sweep.tool';
+import { fallDetectionTool } from './fall-detection.tool';
 
 const tools: ToolDefinition[] = [
   speakTool,
@@ -36,6 +38,8 @@ const tools: ToolDefinition[] = [
   scanRoomTool,
   searchForTool,
   manageAlertsTool,
+  fullSweepTool,
+  fallDetectionTool,
 ];
 
 export function getAllTools(): ToolDefinition[] {
