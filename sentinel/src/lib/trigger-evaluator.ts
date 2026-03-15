@@ -34,8 +34,8 @@ const lastFiredAt = new Map<string, number>();
 /** Last time movement was detected (for lingering/absence). */
 let lastMovementAt = Date.now();
 
-/** Default cooldown: 60 seconds between re-fires of same trigger. */
-const DEFAULT_COOLDOWN_MS = 60_000;
+/** Default cooldown: 30 seconds between re-fires of same trigger. */
+const DEFAULT_COOLDOWN_MS = 30_000;
 
 // ── Public API ───────────────────────────────────────────────
 

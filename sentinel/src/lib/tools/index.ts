@@ -16,6 +16,7 @@ import { clearDataTool } from './clear-data.tool';
 import { startTrackingTool } from './start-tracking.tool';
 import { scanRoomTool } from './scan-room.tool';
 import { searchForTool } from './search-for.tool';
+import { manageAlertsTool } from './manage-alerts.tool';
 
 const tools: ToolDefinition[] = [
   speakTool,
@@ -34,6 +35,7 @@ const tools: ToolDefinition[] = [
   startTrackingTool,
   scanRoomTool,
   searchForTool,
+  manageAlertsTool,
 ];
 
 export function getAllTools(): ToolDefinition[] {

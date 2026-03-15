@@ -11,6 +11,7 @@ import { getDb } from '@/lib/mongodb';
 import { getMission } from '@/lib/mission-engine';
 import { analyzePatterns } from '@/lib/featherless';
 import { sendAlert } from '@/lib/telegram';
+import { isAlertEnabled, isTypeMuted } from '@/lib/tools/manage-alerts.tool';
 import {
   getUniqueCount,
   getNetFlow,
@@ -81,10 +82,10 @@ export async function runTemporalAnalysis(
     const alertPatterns = result.patterns_detected?.filter(
       p => p.severity === 'alert'
     );
-    if (alertPatterns?.length > 0) {
+    if (alertPatterns?.length > 0 && isAlertEnabled() && !isTypeMuted('temporal_analysis')) {
       const alertKey = alertPatterns.map(p => p.type).sort().join(',');
       const lastAlert = lastAlertSent.get(alertKey) ?? 0;
-      if (Date.now() - lastAlert > 120_000) { // 2 minute cooldown per alert type
+      if (Date.now() - lastAlert > 120_000) {
         lastAlertSent.set(alertKey, Date.now());
         const alertMsg = alertPatterns
           .map(p => `${p.type}: ${p.description}`)

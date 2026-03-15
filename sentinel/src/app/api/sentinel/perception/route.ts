@@ -14,6 +14,7 @@ import { updateTracking, resetTracking, getUniqueCount } from '@/lib/person-trac
 import { pollAndRoute } from '@/lib/telegram-poll';
 import { runTemporalAnalysis } from '@/lib/temporal-analysis';
 import { reason, shouldRunPerceptionReasoning } from '@/lib/reasoning-engine';
+import { isAlertEnabled, isTypeMuted } from '@/lib/tools/manage-alerts.tool';
 
 // In-memory latest state for real-time dashboard polling.
 // Exported so other routes can import directly without HTTP loopback.
@@ -270,6 +271,9 @@ async function handleFiredTriggers(
   }
 
   for (const ft of triggers) {
+    // Check if alerts are muted
+    if (!isAlertEnabled() || isTypeMuted('mission_trigger')) continue;
+
     // Speak the alert
     fetch(`${baseUrl}/api/sentinel/speak`, {
       method: 'POST',
