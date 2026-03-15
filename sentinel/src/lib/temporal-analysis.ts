@@ -23,6 +23,7 @@ import {
 // ── Throttle state ───────────────────────────────────────────
 
 let lastAnalysisTime = 0;
+const lastAlertSent = new Map<string, number>(); // cooldown per alert type
 
 // ── Public API ───────────────────────────────────────────────
 
@@ -76,15 +77,20 @@ export async function runTemporalAnalysis(
       }).catch(console.error);
     }
 
-    // Send alert-level patterns to Telegram
+    // Send alert-level patterns to Telegram (with cooldown to prevent spam)
     const alertPatterns = result.patterns_detected?.filter(
       p => p.severity === 'alert'
     );
     if (alertPatterns?.length > 0) {
-      const alertMsg = alertPatterns
-        .map(p => `${p.type}: ${p.description}`)
-        .join('\n');
-      await sendAlert(`Pattern detected:\n${alertMsg}`);
+      const alertKey = alertPatterns.map(p => p.type).sort().join(',');
+      const lastAlert = lastAlertSent.get(alertKey) ?? 0;
+      if (Date.now() - lastAlert > 120_000) { // 2 minute cooldown per alert type
+        lastAlertSent.set(alertKey, Date.now());
+        const alertMsg = alertPatterns
+          .map(p => `${p.type}: ${p.description}`)
+          .join('\n');
+        await sendAlert(`Pattern detected:\n${alertMsg}`);
+      }
     }
 
     // Store as event for the timeline

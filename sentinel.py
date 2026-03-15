@@ -75,6 +75,14 @@ tracking_last_bbox = None  # (x, y, w, h) normalized — last known position for
 tracking_template = None  # cropped template image for OpenCV tracking between Gemini calls
 tracking_last_gemini = 0  # timestamp of last Gemini locate call
 
+# Predictive tracking state
+tracking_last_cx = 0.5   # last known center x
+tracking_last_cy = 0.5   # last known center y
+tracking_vx = 0.0        # velocity x (normalized units/sec)
+tracking_vy = 0.0        # velocity y
+tracking_last_seen = 0.0 # timestamp when target was last seen
+tracking_lost_steps = 0  # how many search steps taken since losing target
+
 
 def init_camera():
     """Initialize webcam capture."""
@@ -171,6 +179,8 @@ def perception_loop():
     Each tick sends a perception update to the dashboard immediately.
     """
     global latest_local_cv, latest_gemini_cache
+    global tracking_last_cx, tracking_last_cy, tracking_vx, tracking_vy
+    global tracking_last_seen, tracking_lost_steps
     frame_ts = 0
 
     # Gemini runs in background thread, never blocks the loop
@@ -199,24 +209,72 @@ def perception_loop():
             if local_cv_data:
                 latest_local_cv = local_cv_data
 
-            # ── Continuous tracking — adjust gimbal to keep target centered ──
+            # ── Continuous tracking with prediction and search ──
             if tracking_enabled and frame is not None and arduino:
                 track_cx, track_cy = _get_tracking_center(
                     frame, local_cv_data, now
                 )
+                cur_pan = latest_sensor_data.get('p', 90)
+                cur_tilt = latest_sensor_data.get('t', 70)
+
                 if track_cx is not None:
-                    offset_x = track_cx - 0.5
-                    offset_y = track_cy - 0.5
+                    # ── Target found — update velocity and follow ──
+                    dt = now - tracking_last_seen if tracking_last_seen > 0 else 0.5
+                    if dt > 0 and dt < 2.0:  # reasonable time delta
+                        # Exponential smoothing on velocity
+                        alpha = 0.4
+                        raw_vx = (track_cx - tracking_last_cx) / dt
+                        raw_vy = (track_cy - tracking_last_cy) / dt
+                        tracking_vx = alpha * raw_vx + (1 - alpha) * tracking_vx
+                        tracking_vy = alpha * raw_vy + (1 - alpha) * tracking_vy
+
+                    tracking_last_cx = track_cx
+                    tracking_last_cy = track_cy
+                    tracking_last_seen = now
+                    tracking_lost_steps = 0
+
+                    # Predictive offset: lead the target slightly based on velocity
+                    lead_time = 0.15  # seconds to predict ahead
+                    pred_cx = track_cx + tracking_vx * lead_time
+                    pred_cy = track_cy + tracking_vy * lead_time
+
+                    offset_x = pred_cx - 0.5
+                    offset_y = pred_cy - 0.5
                     dist = (offset_x ** 2 + offset_y ** 2) ** 0.5
-                    # Tiny dead zone (2%) to prevent micro-jitter
+
                     if dist > 0.02:
-                        cur_pan = latest_sensor_data.get('p', 90)
-                        cur_tilt = latest_sensor_data.get('t', 70)
-                        # Adaptive gain — more aggressive when target is far off center
                         gain = 50 if dist > 0.2 else 35
                         new_pan = int(max(0, min(180, cur_pan - offset_x * gain)))
                         new_tilt = int(max(20, min(130, cur_tilt + offset_y * gain * 0.7)))
                         send_arduino_command(f"MOVE:{new_pan},{new_tilt}")
+
+                else:
+                    # ── Target lost — search in last known direction ──
+                    time_lost = now - tracking_last_seen if tracking_last_seen > 0 else 0
+                    if time_lost > 0.5 and time_lost < 10.0:
+                        tracking_lost_steps += 1
+
+                        # Move in the direction of last velocity (where they were going)
+                        # Each step moves ~8 degrees in that direction
+                        step_size = 8
+                        if abs(tracking_vx) > 0.05 or abs(tracking_vy) > 0.05:
+                            # Follow velocity direction
+                            pan_step = -step_size if tracking_vx > 0 else step_size if tracking_vx < 0 else 0
+                            tilt_step = step_size * 0.5 if tracking_vy > 0 else -step_size * 0.5 if tracking_vy < 0 else 0
+                        else:
+                            # No velocity info — search toward last known side
+                            pan_step = -step_size if tracking_last_cx > 0.5 else step_size
+                            tilt_step = 0
+
+                        new_pan = int(max(0, min(180, cur_pan + pan_step)))
+                        new_tilt = int(max(20, min(130, cur_tilt + tilt_step)))
+                        send_arduino_command(f"MOVE:{new_pan},{new_tilt}")
+
+                    elif time_lost >= 10.0:
+                        # Lost for too long — return to center and stop searching
+                        if tracking_lost_steps > 0:
+                            send_arduino_command("MOVE:90,70")
+                            tracking_lost_steps = 0
 
             # ── Kick off Gemini in background (non-blocking) ──
             if gemini and gemini.should_analyze():
@@ -344,6 +402,8 @@ class CommandHandler(BaseHTTPRequestHandler):
         global latest_browser_frame, latest_browser_frame_b64, latest_browser_cv
         global tracking_enabled, tracking_target_id, tracking_target_desc
         global tracking_last_bbox, tracking_template, tracking_last_gemini
+        global tracking_last_cx, tracking_last_cy, tracking_vx, tracking_vy
+        global tracking_last_seen, tracking_lost_steps
         content_length = int(self.headers.get('Content-Length', 0))
         body = json.loads(self.rfile.read(content_length)) if content_length > 0 else {}
 
@@ -427,6 +487,12 @@ class CommandHandler(BaseHTTPRequestHandler):
                 tracking_last_bbox = None
                 tracking_template = None
                 tracking_last_gemini = 0
+                tracking_last_cx = 0.5
+                tracking_last_cy = 0.5
+                tracking_vx = 0.0
+                tracking_vy = 0.0
+                tracking_last_seen = 0.0
+                tracking_lost_steps = 0
                 desc = tracking_target_desc or f'Person {tracking_target_id}'
                 print(f"[track] Started tracking: {desc}")
                 self._send_json({'ok': True, 'tracking': True, 'target': desc})

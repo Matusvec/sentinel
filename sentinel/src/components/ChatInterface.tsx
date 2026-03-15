@@ -24,7 +24,7 @@ function makeMessage(role: 'user' | 'sentinel', text: string, type?: string, too
   };
 }
 
-/** Play base64 audio and return a promise that resolves when it finishes. */
+/** Play base64 audio with amplification and return a promise that resolves when it finishes. */
 function playAudio(base64: string, audioRef: React.MutableRefObject<HTMLAudioElement | null>): Promise<void> {
   return new Promise((resolve) => {
     if (audioRef.current) {
@@ -32,7 +32,19 @@ function playAudio(base64: string, audioRef: React.MutableRefObject<HTMLAudioEle
       audioRef.current.currentTime = 0;
     }
     const audio = new Audio(`data:audio/mp3;base64,${base64}`);
+    audio.volume = 1.0;
     audioRef.current = audio;
+
+    // Boost volume beyond 100% using Web Audio API gain node
+    try {
+      const ctx = new AudioContext();
+      const source = ctx.createMediaElementSource(audio);
+      const gainNode = ctx.createGain();
+      gainNode.gain.value = 3.0; // 3x amplification
+      source.connect(gainNode);
+      gainNode.connect(ctx.destination);
+    } catch { /* fallback to normal volume */ }
+
     audio.onended = () => resolve();
     audio.onerror = () => resolve();
     audio.play().catch(() => resolve());

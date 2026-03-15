@@ -587,11 +587,13 @@ export default function LiveFeed() {
             }}
             className="rounded-md bg-black/60 border border-zinc-600 px-2.5 py-1 backdrop-blur-sm text-cyan-400 text-[10px] font-mono font-bold hover:bg-zinc-700/60 hover:text-white transition-colors tracking-wider"
           >
-            {cameras.find(c => c.deviceId === selectedCamera)?.label.includes('Logitech')
-              ? 'GIMBAL CAM'
-              : cameras.find(c => c.deviceId === selectedCamera)?.label.slice(0, 12).toUpperCase()
-              || 'LAPTOP CAM'
-            } &#x21C4;
+            {(() => {
+              const cam = cameras.find(c => c.deviceId === selectedCamera);
+              const label = cam?.label || '';
+              if (label.includes('Brio') || label.includes('Logitech') || label.includes('USB')) return 'GIMBAL CAM';
+              if (label.includes('HP') || label.includes('Integrated') || label.includes('Built')) return 'LAPTOP CAM';
+              return label.slice(0, 14).toUpperCase() || 'CAMERA';
+            })()} &#x21C4;
           </button>
         ) : (
           <span className="rounded-md bg-black/60 px-2 py-1 text-zinc-600 text-[10px] font-mono tracking-wider">
